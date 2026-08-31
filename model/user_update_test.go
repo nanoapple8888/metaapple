@@ -92,6 +92,38 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 	assert.Equal(t, "zh", got.GetSetting().Language)
 }
 
+func TestDecreaseUserQuotaNeverMakesBalanceNegative(t *testing.T) {
+	setupUserUpdateTestState(t)
+
+	user := User{
+		Username: "non-negative-quota-user",
+		Password: "password",
+		Status:   common.UserStatusEnabled,
+		Quota:    100,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	oldBatchUpdateEnabled := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = oldBatchUpdateEnabled })
+
+	err := DecreaseUserQuota(user.Id, 101, false)
+	require.ErrorIs(t, err, ErrInsufficientUserQuota)
+
+	var got User
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	assert.Equal(t, 100, got.Quota)
+
+	require.NoError(t, DecreaseUserQuota(user.Id, 100, false))
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	assert.Equal(t, 0, got.Quota)
+
+	err = DecreaseUserQuota(user.Id, 1, false)
+	require.ErrorIs(t, err, ErrInsufficientUserQuota)
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	assert.Equal(t, 0, got.Quota)
+}
+
 func TestEnsureEmailAvailableRejectsExistingEmailCaseInsensitive(t *testing.T) {
 	setupUserUpdateTestState(t)
 

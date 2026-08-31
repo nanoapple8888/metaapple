@@ -19,6 +19,10 @@ import (
 
 const UserNameMaxLength = 20
 
+// ErrInsufficientUserQuota indicates that an atomic wallet deduction could
+// not be completed without taking the user's balance below zero.
+var ErrInsufficientUserQuota = errors.New("user quota is not enough")
+
 var userSortColumns = map[string]string{
 	"id":            "id",
 	"username":      "username",
@@ -1234,9 +1238,8 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 		return errors.New("quota 不能为负数！")
 	}
 	gopool.Go(func() {
-		err := cacheIncrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to increase user quota: " + err.Error())
+		if err := cacheIncrUserQuota(id, int64(quota)); err != nil {
+			common.SysLog("failed to increase user quota cache: " + err.Error())
 		}
 	})
 	if !db && common.BatchUpdateEnabled {
@@ -1258,25 +1261,30 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to decrease user quota: " + err.Error())
-		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
-		return nil
-	}
+	// Wallet deductions must remain atomic even when batch updates are enabled.
+	// The batch path has no balance predicate and could overspend under
+	// concurrency, so only quota increases continue to use it.
 	return decreaseUserQuota(id, quota)
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
-	if err != nil {
-		return err
+	result := DB.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
 	}
-	return err
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("%w: need quota=%d", ErrInsufficientUserQuota, quota)
+	}
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			if err := cacheDecrUserQuota(id, int64(quota)); err != nil {
+				common.SysLog("failed to decrease user quota cache: " + err.Error())
+			}
+		})
+	}
+	return nil
 }
 
 func DeltaUpdateUserQuota(id int, delta int) (err error) {
