@@ -304,19 +304,12 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 }
 
 func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	if info != nil && info.RelayFormat == types.RelayFormatGemini {
+		return serveGeminiNativeJSON(c, info, resp)
 	}
-	service.CloseResponseBodyGracefully(resp)
-	logger.LogDebug(c, "Gemini response body: %s", responseBody)
-	responseBody, _, err = normalizeGeminiMarkdownImages(responseBody)
-	if err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
-	}
+	defer service.CloseResponseBodyGracefully(resp)
 	var geminiResponse dto.GeminiChatResponse
-	err = common.Unmarshal(responseBody, &geminiResponse)
-	if err != nil {
+	if err := common.DecodeJson(resp.Body, &geminiResponse); err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if len(geminiResponse.Candidates) == 0 {
@@ -360,24 +353,23 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 
 	fullTextResponse.Usage = usage
 
+	var responseBody []byte
+	var err error
 	switch info.RelayFormat {
-	case types.RelayFormatOpenAI:
-		responseBody, err = common.Marshal(fullTextResponse)
-		if err != nil {
-			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-		}
 	case types.RelayFormatClaude:
 		convertResult, err := relayconvert.ConvertResponse(c, info, types.RelayFormatClaude, fullTextResponse)
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
-		claudeRespStr, err := common.Marshal(convertResult.Value)
+		responseBody, err = common.Marshal(convertResult.Value)
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
-		responseBody = claudeRespStr
-	case types.RelayFormatGemini:
-		break
+	default:
+		responseBody, err = common.Marshal(fullTextResponse)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
@@ -431,14 +423,9 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 }
 
 func GeminiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	responseBody, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, types.NewOpenAIError(readErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
-	}
-	_ = resp.Body.Close()
-
+	defer service.CloseResponseBodyGracefully(resp)
 	var geminiResponse dto.GeminiImageResponse
-	if jsonErr := common.Unmarshal(responseBody, &geminiResponse); jsonErr != nil {
+	if jsonErr := common.DecodeJson(resp.Body, &geminiResponse); jsonErr != nil {
 		return nil, types.NewOpenAIError(jsonErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
