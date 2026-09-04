@@ -62,6 +62,11 @@ func serveGeminiNativeBuffered(c *gin.Context, info *relaycommon.RelayInfo, resp
 func serveGeminiNativeStreamed(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, prefix []byte) (*dto.Usage, *types.NewAPIError) {
 	src := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 	probe := newGeminiBillingProbe()
+	validationReader, validationWriter := io.Pipe()
+	validationDone := make(chan error, 1)
+	go func() {
+		validationDone <- common.ValidateJSON(validationReader)
+	}()
 	if c.Writer != nil {
 		copyGeminiUpstreamHeaders(c, resp)
 		if resp.ContentLength > 0 {
@@ -76,8 +81,18 @@ func serveGeminiNativeStreamed(c *gin.Context, info *relaycommon.RelayInfo, resp
 	} else {
 		probe.w = io.Discard
 	}
-	if _, err := io.Copy(probe, src); err != nil {
-		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	_, copyErr := io.Copy(io.MultiWriter(probe, validationWriter), src)
+	if copyErr != nil {
+		_ = validationWriter.CloseWithError(copyErr)
+	} else {
+		_ = validationWriter.Close()
+	}
+	validationErr := <-validationDone
+	if copyErr != nil {
+		return nil, types.NewOpenAIError(copyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+	if validationErr != nil {
+		return nil, types.NewOpenAIError(validationErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if c.Writer != nil {
 		c.Writer.Flush()

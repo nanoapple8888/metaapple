@@ -63,6 +63,30 @@ func TestServeGeminiNativeJSONStreamsLargeBodyWithoutHoldingWholeTree(t *testing
 	assert.Equal(t, payload, recorder.Body.Bytes())
 }
 
+func TestServeGeminiNativeJSONRejectsMalformedLargeBody(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:generateContent", nil)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gemini-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gemini-test",
+		},
+	}
+
+	payload := []byte(`{"candidates":[{"content":{"parts":[{"text":"` + strings.Repeat("x", geminiNativeBufferLimit) + `"}]}}]`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(payload)),
+	}
+	_, apiErr := serveGeminiNativeJSON(c, info, resp)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, payload, recorder.Body.Bytes())
+}
+
 func TestGeminiBillingProbeDoesNotRetainHugeTextStrings(t *testing.T) {
 	t.Parallel()
 
