@@ -65,8 +65,13 @@ func serveGeminiNativeStreamed(c *gin.Context, info *relaycommon.RelayInfo, resp
 	validationReader, validationWriter := io.Pipe()
 	validationDone := make(chan error, 1)
 	go func() {
-		validationDone <- common.ValidateJSON(validationReader)
+		validationErr := common.ValidateJSON(validationReader)
+		_, _ = io.Copy(io.Discard, validationReader)
+		validationDone <- validationErr
 	}()
+
+	committed := false
+	var client io.Writer
 	if c.Writer != nil {
 		copyGeminiUpstreamHeaders(c, resp)
 		if resp.ContentLength > 0 {
@@ -77,31 +82,72 @@ func serveGeminiNativeStreamed(c *gin.Context, info *relaycommon.RelayInfo, resp
 			status = http.StatusOK
 		}
 		c.Writer.WriteHeader(status)
-		probe.w = c.Writer
-	} else {
-		probe.w = io.Discard
+		committed = true
+		client = c.Writer
 	}
-	_, copyErr := io.Copy(io.MultiWriter(probe, validationWriter), src)
-	if copyErr != nil {
-		_ = validationWriter.CloseWithError(copyErr)
+
+	clientErr, readErr := copyGeminiNativeBody(src, client, probe, validationWriter)
+	if readErr != nil {
+		_ = validationWriter.CloseWithError(readErr)
 	} else {
 		_ = validationWriter.Close()
 	}
 	validationErr := <-validationDone
-	if copyErr != nil {
-		return nil, types.NewOpenAIError(copyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	if clientErr != nil {
+		logger.LogError(c, "failed to copy gemini native response body: "+clientErr.Error())
 	}
 	if validationErr != nil {
-		return nil, types.NewOpenAIError(validationErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		logger.LogError(c, "gemini native response JSON validation failed: "+validationErr.Error())
 	}
-	if c.Writer != nil {
+	if !committed {
+		if readErr != nil {
+			return nil, types.NewOpenAIError(readErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+		if validationErr != nil {
+			return nil, types.NewOpenAIError(validationErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+	}
+	if c.Writer != nil && clientErr == nil {
 		c.Writer.Flush()
 	}
 	if probe.blockReason != "" {
 		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", probe.blockReason))
 	}
-	usage := usageFromGeminiNativeProbe(c, info, probe)
+	allowTextEstimate := readErr == nil && validationErr == nil
+	usage := usageFromGeminiNativeProbe(c, info, probe, allowTextEstimate)
 	return &usage, nil
+}
+
+// copyGeminiNativeBody forwards src to the client while always feeding the
+// billing probe. A client write error does not stop the upstream drain, so
+// usageMetadata at the end of a large generateContent body can still be billed
+// after a broken pipe.
+func copyGeminiNativeBody(src io.Reader, client io.Writer, probe *geminiBillingProbe, extra io.Writer) (clientErr error, readErr error) {
+	if probe == nil {
+		probe = newGeminiBillingProbe()
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			probe.feed(chunk)
+			if extra != nil {
+				_, _ = extra.Write(chunk)
+			}
+			if client != nil && clientErr == nil {
+				if _, writeErr := client.Write(chunk); writeErr != nil {
+					clientErr = writeErr
+				}
+			}
+		}
+		if err == io.EOF {
+			return clientErr, nil
+		}
+		if err != nil {
+			return clientErr, err
+		}
+	}
 }
 
 func copyGeminiUpstreamHeaders(c *gin.Context, src *http.Response) {
@@ -116,18 +162,17 @@ func copyGeminiUpstreamHeaders(c *gin.Context, src *http.Response) {
 	}
 }
 
-func usageFromGeminiNativeProbe(c *gin.Context, info *relaycommon.RelayInfo, probe *geminiBillingProbe) dto.Usage {
-	if probe == nil {
-		usage := service.ResponseText2Usage(c, "", info.UpstreamModelName, info.GetEstimatePromptTokens())
-		attachEstimatedGeminiBillingUsage(usage)
-		return *usage
-	}
-	if dto.HasGeminiUsageMetadataTokens(&probe.usage) {
+func usageFromGeminiNativeProbe(c *gin.Context, info *relaycommon.RelayInfo, probe *geminiBillingProbe, allowTextEstimate bool) dto.Usage {
+	if probe != nil && dto.HasGeminiUsageMetadataTokens(&probe.usage) {
 		usage := buildUsageFromGeminiMetadata(&probe.usage, info.GetEstimatePromptTokens())
 		patchGeminiZeroCompletionUsage(c, info, &usage, probe.text.String(), probe.imageCount)
 		return usage
 	}
-	usage := service.ResponseText2Usage(c, probe.text.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	text := ""
+	if allowTextEstimate && probe != nil {
+		text = probe.text.String()
+	}
+	usage := service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	attachEstimatedGeminiBillingUsage(usage)
 	return *usage
 }

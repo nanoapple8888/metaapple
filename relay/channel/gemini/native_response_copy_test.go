@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -63,7 +64,7 @@ func TestServeGeminiNativeJSONStreamsLargeBodyWithoutHoldingWholeTree(t *testing
 	assert.Equal(t, payload, recorder.Body.Bytes())
 }
 
-func TestServeGeminiNativeJSONRejectsMalformedLargeBody(t *testing.T) {
+func TestServeGeminiNativeJSONDoesNotFailRequestAfterMalformedLargeBody(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -82,9 +83,109 @@ func TestServeGeminiNativeJSONRejectsMalformedLargeBody(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(bytes.NewReader(payload)),
 	}
-	_, apiErr := serveGeminiNativeJSON(c, info, resp)
-	require.NotNil(t, apiErr)
+	usage, apiErr := serveGeminiNativeJSON(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 0, usage.CompletionTokens)
 	assert.Equal(t, payload, recorder.Body.Bytes())
+}
+
+func TestCopyGeminiNativeBodyDrainsUsageAfterClientWriteError(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"` + strings.Repeat("A", geminiNativeBufferLimit) + `"}}]}}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1400,"totalTokenCount":1409}}`)
+	require.Greater(t, len(payload), geminiNativeBufferLimit)
+
+	probe := newGeminiBillingProbe()
+	client := &failAfterBuffer{after: 128}
+	clientErr, readErr := copyGeminiNativeBody(bytes.NewReader(payload), client, probe, nil)
+	require.Error(t, clientErr)
+	require.NoError(t, readErr)
+	assert.Equal(t, 9, probe.usage.PromptTokenCount)
+	assert.Equal(t, 1400, probe.usage.CandidatesTokenCount)
+	assert.Equal(t, 1409, probe.usage.TotalTokenCount)
+	assert.Equal(t, 1, probe.imageCount)
+	assert.Less(t, client.buf.Len(), len(payload))
+}
+
+func TestServeGeminiNativeJSONSettlesUsageAfterClientBrokenPipe(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Writer = &failAfterGinWriter{ResponseWriter: c.Writer, after: 256}
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:generateContent", nil)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gemini-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gemini-test",
+		},
+	}
+
+	blob := strings.Repeat("B", geminiNativeBufferLimit+32)
+	payload := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"` + blob + `"}}]}}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1400,"totalTokenCount":1409}}`)
+	require.Greater(t, len(payload), geminiNativeBufferLimit)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(payload)),
+	}
+	usage, apiErr := serveGeminiNativeJSON(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 9, usage.PromptTokens)
+	assert.Equal(t, 1400, usage.CompletionTokens)
+	assert.Less(t, recorder.Body.Len(), len(payload))
+}
+
+type failAfterBuffer struct {
+	buf   bytes.Buffer
+	after int
+}
+
+func (w *failAfterBuffer) Write(p []byte) (int, error) {
+	if w.buf.Len() >= w.after {
+		return 0, errors.New("write: broken pipe")
+	}
+	remain := w.after - w.buf.Len()
+	if len(p) > remain {
+		n, err := w.buf.Write(p[:remain])
+		if err != nil {
+			return n, err
+		}
+		return n, errors.New("write: broken pipe")
+	}
+	return w.buf.Write(p)
+}
+
+type failAfterGinWriter struct {
+	gin.ResponseWriter
+	after int
+	wrote int
+}
+
+func (w *failAfterGinWriter) Write(p []byte) (int, error) {
+	if w.wrote >= w.after {
+		return 0, errors.New("write: broken pipe")
+	}
+	remain := w.after - w.wrote
+	if len(p) > remain {
+		n, err := w.ResponseWriter.Write(p[:remain])
+		w.wrote += n
+		if err != nil {
+			return n, err
+		}
+		return n, errors.New("write: broken pipe")
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.wrote += n
+	return n, err
+}
+
+func (w *failAfterGinWriter) WriteString(s string) (int, error) {
+	return w.Write([]byte(s))
 }
 
 func TestGeminiBillingProbeDoesNotRetainHugeTextStrings(t *testing.T) {
