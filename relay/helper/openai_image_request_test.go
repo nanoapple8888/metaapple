@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -164,6 +165,38 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, req.ResponseFormat)
 	})
+
+	for _, model := range []string{"gpt-image-2.5", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"} {
+		t.Run(model+" response_format", func(t *testing.T) {
+			for _, format := range []string{"", "url", "b64_json"} {
+				payload := map[string]string{
+					"model": model, "prompt": "a cat", "output_format": "png",
+				}
+				if format != "" {
+					payload["response_format"] = format
+				}
+				body, err := common.Marshal(payload)
+				require.NoError(t, err)
+				c := newJSONContext(t, string(body))
+				req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+				require.NoError(t, err)
+				assert.Equal(t, format, req.ResponseFormat)
+			}
+
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", model))
+			require.NoError(t, writer.WriteField("prompt", "edit this image"))
+			require.NoError(t, writer.Close())
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
+			require.NoError(t, err)
+			assert.Empty(t, req.ResponseFormat)
+			assert.NotContains(t, c.Request.MultipartForm.Value, "response_format")
+		})
+	}
 
 	t.Run("absent response_format defaults to b64_json for gpt-image-1", func(t *testing.T) {
 		c := newJSONContext(t, `{"model":"gpt-image-1","prompt":"a cat"}`)

@@ -264,7 +264,7 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 
 	// Codex image_gen cannot send response_format and only parses b64_json.
 	// Keep that compatibility default for earlier gpt-image models, but let
-	// gpt-image-2 use its native parameter surface without response_format.
+	// gpt-image-2 / gpt-image-2.5 use their native parameter surface without response_format.
 	// Explicit response_format (including url) is always preserved.
 	if strings.TrimSpace(imageRequest.ResponseFormat) == "" && prefersB64JSONImageResponse(imageRequest.Model) {
 		imageRequest.ResponseFormat = "b64_json"
@@ -284,7 +284,7 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 
 func prefersB64JSONImageResponse(modelName string) bool {
 	modelName = strings.ToLower(strings.TrimSpace(modelName))
-	if modelName == "gpt-image-2" || strings.HasPrefix(modelName, "gpt-image-2-") {
+	if modelName == "gpt-image-2" || strings.HasPrefix(modelName, "gpt-image-2-") || strings.HasPrefix(modelName, "gpt-image-2.") {
 		return false
 	}
 	return strings.HasPrefix(modelName, "gpt-image") || strings.HasPrefix(modelName, "chatgpt-image")
